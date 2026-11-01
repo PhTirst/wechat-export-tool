@@ -1,8 +1,8 @@
 # WeChat Export Tool
 
-面向 **Windows x64 微信 4.x** 的本地聊天记录导出工具。选择一个联系人或群聊，将本机已保存的消息导出为结构化 JSON，以及可以直接打开的含附件离线网页。
+面向 **Windows x64 微信 4.x** 的本地聊天记录导出工具。通过桌面界面或 CLI 选择一个联系人或群聊，将本机已保存的消息导出为结构化 JSON，以及可以直接打开的含附件离线网页。
 
-This is a local Windows WeChat export CLI. It exports a selected conversation to JSON and an offline HTML viewer, with locally available attachments.
+This local Windows WeChat exporter includes a native desktop UI and an automation-friendly CLI. It exports a selected conversation to JSON and an offline HTML viewer, with locally available attachments.
 
 目前为早期版本，微信版本、数据库代次和附件缓存状态都会影响兼容性。未知、空白或无法解析的消息仍进入导出列表，以占位文字和 `parse_status: "unparsed"` 标记，并保留原始行；未能导出的附件也会标注原因。启动成功或找到数据库不代表完整导出成功。
 
@@ -16,7 +16,32 @@ This is a local Windows WeChat export CLI. It exports a selected conversation to
 
 常规导出读取本地文件和已有密钥缓存，不自动重启微信、不自动启动调试取钥，也不从远端 CDN 下载缺失附件。安装依赖、构建取钥程序需要网络；查看导出网页不需要网络。
 
-## 安装
+## 下载 Windows 便携版
+
+从 [GitHub Releases](https://github.com/PhTirst/wechat-export-tool/releases) 下载 `WeChatExportTool-v0.2.0-windows-x64.zip`，**解压整个目录**后双击 `WeChatExportTool.exe`。发布包包含 Python/Tk、取钥程序和 Node/SILK 运行时，用户无需安装 Python、Go 或 Node.js。
+
+1. 在“微信数据目录”中选择包含账号子目录的 `xwechat_files`，点击“刷新账号”并选择正确账号。
+2. 如密钥尚未就绪，点击“获取本机密钥”，等待监听就绪后按提示在本机微信中操作。程序不自动退出或重启微信；“停止监听”会等待取钥程序安全结束。
+3. 点击“读取联系人 / 群聊”，通过搜索和类型筛选选择一个会话。同名会话应根据稳定标识区分。
+4. 选择“导出保存到”的父目录，点击“导出所选会话”。每次导出会新建带时间戳的目录。
+5. 完成后点击“打开离线网页”，备份时复制整个导出目录。
+
+同目录的 `wechat-export.exe` 是供脚本和 AI 工具调用的控制台程序。请保留 `_internal`、`runtime` 等目录，不要只复制一个 exe。
+
+```powershell
+.\wechat-export.exe doctor --json
+.\wechat-export.exe accounts --json
+.\wechat-export.exe --account ACCOUNT_DIRECTORY conversations --query "示例好友" --kind contact --json
+.\wechat-export.exe --account ACCOUNT_DIRECTORY export --conversation-id CONVERSATION_ID --output .\exports\selected-chat-001 --json
+```
+
+`ACCOUNT_DIRECTORY` 和 `CONVERSATION_ID` 是占位符，应替换为列表返回的稳定 ID。`--json` 模式不进行交互选择；成功结果写入标准输出，取钥进度写入标准错误，失败使用非零退出码。`doctor` 只检查运行时，不读取账号或密钥。
+
+详细操作与构建见 [Windows 使用说明](docs/WINDOWS_RELEASE.md)，机器调用合同见 [CLI 自动化说明](docs/CLI_AUTOMATION.md)。运行 `WeChatExportTool.exe --demo` 可以仅用合成数据体验界面，不读取真实微信账号。FFmpeg/ffprobe 是否随具体发行包提供，以包内清单和 [运行时说明](docs/WINDOWS_RUNTIME_LICENSES.md) 为准；缺少它们时，特殊视频或特殊图片的转换可能不可用。
+
+## 从源码安装
+
+普通下载用户使用上面的 Windows 便携包即可，以下步骤供开发者使用。
 
 需要 Windows x64、Python 3.11 或更新版本，以及 Git。语音导出另需 Node.js 18+。FFmpeg 和 ffprobe 可选，用于视频兼容转换和媒体校验；请自行安装支持所需编解码器的发行版本。
 
@@ -42,11 +67,13 @@ Python 安装会从固定 Git 提交安装 `chatlog-keeper`。`npm ci` 安装固
 .\scripts\build_capture.ps1
 ```
 
-脚本获取固定版本的 WxMori、应用本仓库的兼容性补丁，生成 `bin/wxmori-media.exe`。本仓库不附带微信、FFmpeg 或预编译取钥程序。
+脚本获取固定版本的 WxMori、应用本仓库的兼容性补丁，生成 `bin/wxmori-media.exe`。源码树不提交微信、运行时或预编译取钥程序；Windows 发布资产另行包含经过清单核对的运行组件。
 
 也可以通过 `--capture-exe` 指定自行构建的兼容程序；未应用补丁的上游程序不一定覆盖相同的媒体数据库。
 
 ## 使用
+
+下面使用源码安装后的 `wechat-export` 命令。便携版将其替换为 `.\wechat-export.exe` 即可；参数与导出引擎相同。
 
 以下 `ACCOUNT_DIRECTORY` 和 `CONVERSATION_ID` 都是占位符，请替换为列表中实际返回的值。
 
@@ -156,6 +183,13 @@ wechat-export config set --clear-account
 
 ## 开发与验证
 
+源码图形界面和合成演示：
+
+```powershell
+.\.venv\Scripts\wechat-export-gui.exe
+.\.venv\Scripts\python.exe -m wechat_export_tool.gui --demo
+```
+
 不读取微信文件，也可以先生成含图片、声音和文件的合成演示：
 
 ```powershell
@@ -174,6 +208,6 @@ python -m pytest
 
 本项目以 **GPL-3.0-only** 发布，见 [LICENSE](LICENSE)。它是在开源项目基础上实现的适配与导出工具，不宣称底层微信解密或媒体编解码算法为本项目独创。
 
-主要依赖为 [chatlog-keeper](https://github.com/labazhou2024/chatlog-keeper)、[WxMori](https://github.com/axiomzero-qed/WxMori)、[silk-wasm](https://github.com/idranme/silk-wasm) 及 FFmpeg/Pillow 等通用组件。媒体格式适配还参考了 [WeChatDecrypted](https://github.com/kclx/WeChatDecrypted) 和 [wechatauto-replica](https://github.com/fanyuantaier/wechatauto-replica) 的公开格式研究。
+主要依赖为 [chatlog-keeper](https://github.com/labazhou2024/chatlog-keeper)、[WxMori](https://github.com/axiomzero-qed/WxMori)、[silk-wasm](https://github.com/idranme/silk-wasm) 及 Python、Tk、Node.js、Pillow 等通用组件；FFmpeg/ffprobe 用于可选的媒体转换与探测。媒体格式适配还参考了 [WeChatDecrypted](https://github.com/kclx/WeChatDecrypted) 和 [wechatauto-replica](https://github.com/fanyuantaier/wechatauto-replica) 的公开格式研究。
 
 依赖与参考项目保留各自许可证。精确提交、职责边界和原始许可声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 与 [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md)。

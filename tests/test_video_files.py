@@ -11,6 +11,7 @@ import unittest
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from wechat_export_tool import video_file_attachments as media
@@ -26,6 +27,7 @@ class VideoFileTests(unittest.TestCase):
         self.target = "synthetic-conversation"
         self.timestamp = int(datetime(2026, 10, 1, tzinfo=timezone.utc).timestamp())
         self.payload = b"synthetic bytes"
+        media._encoder_options_cached.cache_clear()
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -200,6 +202,78 @@ class VideoFileTests(unittest.TestCase):
         self.assertTrue(media._compatible(media._probe(self.output / entries[0]["path"], Path(ffprobe))))
         self.assertEqual(entries[1]["kind"], "file")
         self.assertEqual((self.output / entries[1]["path"]).read_bytes(), source.read_bytes())
+
+    def test_encoder_probe_prefers_x264_and_caches_selected_binary_revision(self):
+        executable = self.root / "synthetic-ffmpeg.exe"
+        executable.write_bytes(b"synthetic executable identity")
+        listing = b" V....D h264_mf  H264 via MediaFoundation\n V....D libx264 libx264 H.264\n"
+        with patch.object(media.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=listing)) as run:
+            options = media._video_encoder_options(executable)
+            self.assertEqual(options[1], "libx264")
+            self.assertIn("-crf", options)
+            self.assertNotIn("-hw_encoding", options)
+            self.assertEqual(media._video_encoder_options(executable), options)
+            run.assert_called_once()
+            command = run.call_args.args[0]
+            self.assertEqual(command, [str(executable.resolve()), "-nostdin", "-hide_banner", "-encoders"])
+            self.assertEqual(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
+            executable.write_bytes(b"another synthetic executable revision")
+            media._video_encoder_options(executable)
+            self.assertEqual(run.call_count, 2)
+
+    def test_media_foundation_uses_its_own_software_encoder_controls(self):
+        executable = self.root / "synthetic-ffmpeg.exe"
+        executable.write_bytes(b"synthetic executable identity")
+        with patch.object(media.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=b" V....D h264_mf  H264 via MediaFoundation\n")):
+            options = media._video_encoder_options(executable)
+        self.assertEqual(options[1], "h264_mf")
+        self.assertEqual(options[options.index("-hw_encoding") + 1], "0")
+        self.assertIn("-b:v", options)
+        self.assertNotIn("-preset", options)
+        self.assertNotIn("-crf", options)
+        self.assertEqual(options[-2:], ("-pix_fmt", "yuv420p"))
+
+    def test_missing_h264_encoder_never_falls_back_to_mpeg4(self):
+        executable = self.root / "synthetic-ffmpeg.exe"
+        executable.write_bytes(b"synthetic executable identity")
+        original = self.root / "synthetic-original.mp4"
+        original.write_bytes(self.payload)
+        with patch.object(media, "_probe", return_value=None), patch.object(media.subprocess, "run",
+                return_value=SimpleNamespace(returncode=0, stdout=b" V..... mpeg4 MPEG-4\n")) as run:
+            playable, reason = media._playable(original, executable, self.root / "synthetic-ffprobe.exe")
+        self.assertIsNone(playable)
+        self.assertIn("H.264", reason)
+        self.assertEqual(original.read_bytes(), self.payload)
+        self.assertEqual(run.call_count, 1)
+        self.assertFalse(original.with_name(original.stem + "_播放.mp4").exists())
+
+    def test_media_foundation_playback_copy_is_validated_before_publication(self):
+        executable = self.root / "synthetic-ffmpeg.exe"
+        executable.write_bytes(b"synthetic executable identity")
+        original = self.root / "synthetic-original.mp4"
+        original.write_bytes(self.payload)
+        compatible = {"streams": [{"codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p"}],
+                      "format": {"format_name": "mov,mp4"}}
+        commands = []
+        def invoke(command, **kwargs):
+            commands.append(command)
+            if "-encoders" in command:
+                return SimpleNamespace(returncode=0, stdout=b" V....D h264_mf H264 via MediaFoundation\n")
+            self.assertEqual(command[command.index("-c:v") + 1], "h264_mf")
+            self.assertNotIn("-preset", command)
+            self.assertNotIn("-crf", command)
+            self.assertEqual(command[command.index("-protocol_whitelist") + 1], "file,pipe")
+            Path(command[-1]).write_bytes(b"synthetic validated playback copy")
+            return SimpleNamespace(returncode=0)
+        with patch.object(media, "_probe", side_effect=[None, compatible]) as probe, \
+             patch.object(media.subprocess, "run", side_effect=invoke):
+            playable, reason = media._playable(original, executable, self.root / "synthetic-ffprobe.exe")
+        self.assertIsNone(reason)
+        self.assertEqual(playable.read_bytes(), b"synthetic validated playback copy")
+        self.assertEqual(original.read_bytes(), self.payload)
+        self.assertEqual(probe.call_count, 2)
+        self.assertEqual(len(commands), 2)
 
 
 if __name__ == "__main__":

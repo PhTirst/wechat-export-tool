@@ -1,0 +1,3 @@
+# Build-time only; not installed by users of the portable Windows ZIP.
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.9

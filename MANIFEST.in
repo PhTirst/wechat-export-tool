@@ -1,7 +1,8 @@
-include LICENSE THIRD_PARTY_NOTICES.md README.md package.json package-lock.json
+include LICENSE THIRD_PARTY_NOTICES.md README.md package.json package-lock.json requirements-build.txt
 recursive-include licenses *
 recursive-include patches *.patch
 recursive-include scripts *.py *.ps1
 recursive-include docs *.md
 recursive-include tests *.py
+recursive-include packaging *.py *.spec *.txt *.terms
 recursive-include src/wechat_export_tool/assets *.cjs

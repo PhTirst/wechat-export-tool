@@ -5,8 +5,8 @@ import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-ALLOW = {"src", "tests", "docs", "licenses", "patches", "scripts", ".github", "examples"}
-TOP = {".gitignore", ".gitattributes", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "pyproject.toml", "package.json", "package-lock.json", "MANIFEST.in"}
+ALLOW = {"src", "tests", "docs", "licenses", "patches", "scripts", "packaging", ".github", "examples"}
+TOP = {".gitignore", ".gitattributes", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "pyproject.toml", "package.json", "package-lock.json", "MANIFEST.in", "requirements-build.txt"}
 FORBIDDEN = re.compile(r"(?i)(?:[A-Z]:[\\/]Users[\\/](?!Public(?:[\\/]|$))[^\\/\s]+|wxid_[a-z0-9]{8,}|(?:sk-|gh[pousr]_)[A-Za-z0-9_]{20,}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)")
 
 def main():

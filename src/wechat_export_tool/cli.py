@@ -62,6 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
         version = "development"
     parser.add_argument("--version", action="version", version="%(prog)s " + version)
     commands = parser.add_subparsers(dest="command", parser_class=_Parser)
+    commands.add_parser("doctor", parents=[common], help="检查运行时与机器调用能力，不读取账号或密钥")
     commands.add_parser("accounts", parents=[common], help="列出本机微信账号")
     conversations = commands.add_parser("conversations", parents=[common], help="查找联系人或群聊及稳定 ID")
     export = commands.add_parser("export", parents=[common], help="导出一个明确选择的会话")
@@ -165,24 +166,57 @@ def _effective_config(arguments: argparse.Namespace) -> ExportConfig:
                if hasattr(arguments, field.name)}
     if getattr(arguments, "clear_account", False):
         options["account_id"] = None
-    return dataclasses.replace(config, **options) if options else config
+    from .runtime import apply_bundled_defaults
+    return apply_bundled_defaults(dataclasses.replace(config, **options) if options else config)
+
+
+def _failure(code: str, message: str, exit_code: int, *, json_mode: bool,
+             output: TextIO, errors: TextIO) -> int:
+    if json_mode:
+        _print_json({"schema_version": 1, "ok": False, "exit_code": exit_code,
+                     "error": {"code": code, "message": message}}, output)
+    else:
+        print(message, file=errors)
+    return exit_code
 
 
 def main(argv: list[str] | None = None, *, stdin: TextIO | None = None,
          stdout: TextIO | None = None, stderr: TextIO | None = None) -> int:
+    # Console executables must keep their pipe protocol independent of the
+    # machine's legacy code page. Injected streams and windowed None handles
+    # are deliberately left alone.
+    for supplied, actual in ((stdout, sys.stdout), (stderr, sys.stderr)):
+        reconfigure = getattr(actual, "reconfigure", None) if supplied is None else None
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
     input_stream, output, errors = stdin or sys.stdin, stdout or sys.stdout, stderr or sys.stderr
     parser = build_parser()
+    raw_arguments = list(sys.argv[1:] if argv is None else argv)
+    json_mode = "--json" in raw_arguments
     try:
         with redirect_stdout(output), redirect_stderr(errors):
-            arguments = parser.parse_args(argv)
+            arguments = parser.parse_args(raw_arguments)
         if not arguments.command:
             parser.print_help(file=output)
             return 0
         config = _effective_config(arguments)
         json_mode = getattr(arguments, "json", False)
+        if arguments.command == "doctor":
+            from .runtime import runtime_report
+            report = runtime_report(config)
+            report["commands"] = ["doctor", "accounts", "conversations", "capture", "export", "config"]
+            report["json_contract"] = {"schema_version": 1, "stdout": "one_json_value",
+                "progress": "stderr_json_lines", "encoding": "utf-8", "interactive": False,
+                "exit_codes": {"success": 0, "operation_failed": 1, "invalid_arguments": 2, "cancelled": 130}}
+            _print_json(report, output)
+            return 0
         if arguments.command == "config":
             if arguments.config_action == "set":
-                path = save_config(config, getattr(arguments, "config", None))
+                from .runtime import without_bundled_defaults
+                path = save_config(without_bundled_defaults(config), getattr(arguments, "config", None))
                 _print_json({"saved": True, "config": path}, output)
             elif arguments.config_action in ("show", None):
                 _print_json(config.to_dict(), output)
@@ -205,9 +239,14 @@ def main(argv: list[str] | None = None, *, stdin: TextIO | None = None,
             probe = arguments.images_probe
             if arguments.conversation_id:
                 probe = backend.prepare_image_probe(config, arguments.conversation_id)
+            def capture_progress(event):
+                print(json.dumps({"capture": _safe_output(event)}, ensure_ascii=False),
+                      file=errors, flush=True)
             result = backend.capture_keys(config, timeout=arguments.timeout, pid=arguments.pid,
-                                          images_probe=probe)
+                                          images_probe=probe, progress_cb=capture_progress)
             _print_json(result, output)
+            if isinstance(result, dict) and result.get("cancelled") is True:
+                return 130
             return 1 if isinstance(result, dict) and result.get("returncode", 0) != 0 else 0
         conversations = None
         if arguments.command == "conversations" or not arguments.conversation_id:
@@ -243,15 +282,15 @@ def main(argv: list[str] | None = None, *, stdin: TextIO | None = None,
     except SystemExit as exc:
         return int(exc.code or 0)
     except (ConfigError, _UsageError) as exc:
-        print(str(exc), file=errors)
-        return 2
+        return _failure("invalid_configuration" if isinstance(exc, ConfigError) else "invalid_arguments",
+                        str(exc), 2, json_mode=json_mode, output=output, errors=errors)
     except KeyboardInterrupt:
-        print("已取消。", file=errors)
-        return 130
+        return _failure("cancelled", "已取消。", 130, json_mode=json_mode, output=output, errors=errors)
     except Exception as exc:
         # Database parsers and native tools may put secrets in their exception
         # messages. Only the exception class is allowed into this diagnostic.
         from .errors import ExportError
         detail = exc.code if isinstance(exc, ExportError) else type(exc).__name__
-        print(f"操作失败（{detail}）。请检查配置和本机密钥捕获状态。", file=errors)
-        return 1
+        return _failure(detail if isinstance(exc, ExportError) else "operation_failed",
+                        f"操作失败（{detail}）。请检查配置和本机密钥捕获状态。", 1,
+                        json_mode=json_mode, output=output, errors=errors)

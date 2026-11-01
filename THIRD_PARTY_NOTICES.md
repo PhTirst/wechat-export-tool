@@ -28,7 +28,7 @@ WeChat Export Tool is distributed under **GPL-3.0-only**. See [LICENSE](LICENSE)
 - npm version: `3.7.1`
 - Copyright: Copyright (c) 2024 idranme
 - License: MIT; verbatim copy in [licenses/silk-wasm-MIT.txt](licenses/silk-wasm-MIT.txt).
-- Use: optional SILK-to-PCM decoding invoked by a local Node.js batch adapter. The wasm package is installed using npm rather than copied into this source repository.
+- Use: SILK-to-PCM decoding invoked by a local Node.js batch adapter. Source installations use npm; the Windows portable release includes the pinned module and wasm with their license. Binary resources are not committed into this source tree.
 
 ## Format research references
 
@@ -39,6 +39,8 @@ The format adapters do not claim that the underlying formats or cryptographic al
 
 ## Other installed or external components
 
-Python, PyCryptodome, NumPy, python-zstandard, Pillow, Node.js, FFmpeg/ffprobe, and WxMori's transitive Go modules retain their own licenses. Their role and licensing scope are described in [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md). Installed distributions can include additional bundled-library notices; consult those distributions when redistributing them.
+Python, Tcl/Tk, PyCryptodome, NumPy, python-zstandard, Pillow, Node.js, FFmpeg/ffprobe, and WxMori's transitive Go modules retain their own licenses. Their role and licensing scope are described in [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md). Installed distributions can include additional bundled-library notices; consult those distributions when redistributing them.
 
-This repository does not bundle Python wheels, Node.js, FFmpeg, WeChat or precompiled capture binaries. Download/build steps and local execution are separate from publication of this source repository.
+The source tree does not commit Python wheels, Node.js, SILK wasm, WeChat or precompiled capture binaries. Windows release assets separately distribute an embedded Python/Tk runtime, the compiled patched WxMori backend, Node.js and SILK resources. The portable package preserves project notices in `licenses/`, runtime and transitive-component notices in `third-party-licenses/`, and exact artifact details in `bundle-manifest.json`. See [Windows runtime licensing](docs/WINDOWS_RUNTIME_LICENSES.md) for the actual release's FFmpeg scope, source URLs and checksums.
+
+PyInstaller is used to assemble the Windows application. Its bootloader exception permits distribution of bundled applications under their own licenses; the release preserves its applicable notices. Packaging does not change the license of Python, Tk, Node.js or any embedded dependency.

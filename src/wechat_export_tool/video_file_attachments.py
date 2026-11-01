@@ -21,6 +21,7 @@ from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 
 _TZ = timezone(timedelta(hours=8))
@@ -268,6 +269,39 @@ def _compatible(probe):
         stream.get("codec_name") in {"aac", "mp3", "opus", "vorbis"} for stream in audio)
 
 
+@lru_cache(maxsize=16)
+def _encoder_options_cached(executable: str, _mtime_ns: int, _size: int) -> tuple[str, ...] | None:
+    """Probe only the selected local binary, once per executable revision."""
+    try:
+        result = subprocess.run([executable, "-nostdin", "-hide_banner", "-encoders"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=30, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        raw = result.stdout
+        if result.returncode != 0 or not isinstance(raw, (str, bytes)) or len(raw) > 1 << 20:
+            return None
+        listing = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+        encoders = set(re.findall(r"(?m)^\s*V[A-Z.]{5}\s+(libx264|h264_mf)\s", listing))
+        if "libx264" in encoders:
+            return ("-c:v", "libx264", "-preset", "fast", "-crf", "21", "-pix_fmt", "yuv420p")
+        if "h264_mf" in encoders:
+            # FFmpeg's Media Foundation encoder accepts YUV420P and defaults
+            # to Windows' software MFT. Its AVOptions do not include x264's
+            # preset/crf controls. No external GPL encoder is required here.
+            return ("-c:v", "h264_mf", "-hw_encoding", "0", "-b:v", "2500k", "-pix_fmt", "yuv420p")
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+def _video_encoder_options(ffmpeg: Path) -> tuple[str, ...] | None:
+    try:
+        selected = Path(ffmpeg).resolve(strict=True)
+        metadata = selected.stat()
+        return _encoder_options_cached(str(selected), metadata.st_mtime_ns, metadata.st_size)
+    except OSError:
+        return None
+
+
 def _playable(original, ffmpeg, ffprobe):
     if _compatible(_probe(original, ffprobe)):
         return original, None
@@ -279,6 +313,9 @@ def _playable(original, ffmpeg, ffprobe):
     if converted.is_file() and _compatible(_probe(converted, ffprobe)):
         secure_file(converted)
         return converted, None
+    video_options = _video_encoder_options(ffmpeg)
+    if video_options is None:
+        return None, "视频原件已保存；转换工具没有可用的网页兼容 H.264 编码器"
     descriptor, temporary_name = tempfile.mkstemp(prefix=".video-", suffix=".mp4", dir=original.parent)
     os.close(descriptor)
     temporary = Path(temporary_name)
@@ -286,7 +323,7 @@ def _playable(original, ffmpeg, ffprobe):
     try:
         result = subprocess.run([str(ffmpeg), "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
             "-protocol_whitelist", "file,pipe", "-format_whitelist", "mov,matroska,webm", "-i", str(original),
-            "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "fast", "-crf", "21", "-pix_fmt", "yuv420p",
+            "-map", "0:v:0", "-map", "0:a:0?", *video_options,
             "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(temporary)],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
             timeout=900, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))

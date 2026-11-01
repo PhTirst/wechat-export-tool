@@ -6,6 +6,7 @@ WeChat process, existing cache, personal database or account data is inspected.
 from __future__ import annotations
 
 import base64
+import ctypes
 import contextlib
 import hashlib
 import io
@@ -16,6 +17,7 @@ import sqlite3
 import struct
 import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -170,6 +172,7 @@ class CaptureTests(unittest.TestCase):
     def invoke(self, process, **kwargs):
         output = io.StringIO()
         with patch.object(backend, "os", self.os_mock), \
+             patch.object(backend, "_capture_console", side_effect=contextlib.nullcontext), \
              patch.object(subprocess, "CREATE_NEW_PROCESS_GROUP", 512, create=True), \
              patch.object(signal, "CTRL_BREAK_EVENT", 1, create=True), \
              patch.object(backend.subprocess, "Popen", return_value=process) as spawn, \
@@ -213,6 +216,69 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(generated["data_dir"], str((self.config.account_root / "db_storage").absolute()))
         self.assertTrue(process.stdout.closed)
         process.send_signal.assert_not_called()
+        self.assertEqual(output, "")
+
+    def test_gui_progress_is_callback_only_and_cancel_waits_for_detachment(self):
+        cancelled = threading.Event()
+        events = []
+        def progress(event):
+            events.append(event)
+            if event.get("state") == "watching_login":
+                cancelled.set()
+        process = self.process([json.dumps({"state": "watching_login", "running": True,
+                                          "key": "SECRET_SENTINEL"})])
+        result, output, _ = self.invoke(process, cancel_event=cancelled, progress_cb=progress)
+        self.assertEqual(result["returncode"], 130)
+        self.assertTrue(result["cancelled"])
+        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(output, "")
+        self.assertNotIn("SECRET_SENTINEL", json.dumps(events))
+        process.send_signal.assert_called_once_with(1)
+        process.wait.assert_called_once_with(timeout=30)
+        process.kill.assert_not_called()
+        process.terminate.assert_not_called()
+
+    def test_cancellation_timeout_keeps_waiting_instead_of_killing(self):
+        cancelled = threading.Event()
+        process = self.process([json.dumps({"state": "watching_login"})])
+        process.wait.side_effect = [subprocess.TimeoutExpired("synthetic", 30), 0]
+        events = []
+        def progress(event):
+            events.append(event)
+            cancelled.set()
+        result, _, _ = self.invoke(process, cancel_event=cancelled, progress_cb=progress)
+        self.assertTrue(result["cancelled"])
+        self.assertEqual(process.wait.call_count, 2)
+        self.assertEqual(events[-1], {"state": "stopping", "running": True})
+        process.kill.assert_not_called()
+
+    def test_already_cancelled_job_does_not_spawn_or_touch_configuration(self):
+        cancelled = threading.Event()
+        cancelled.set()
+        process = self.process()
+        result, _, spawn = self.invoke(process, cancel_event=cancelled)
+        self.assertEqual(result["returncode"], 130)
+        spawn.assert_not_called()
+        self.assertFalse(backend.capture_config_path(self.config).exists())
+
+    def test_faulty_ui_callback_cannot_abandon_child(self):
+        process = self.process([json.dumps({"state": "completed"})])
+        def callback(event):
+            raise RuntimeError("synthetic broken UI")
+        result, _, _ = self.invoke(process, progress_cb=callback)
+        self.assertEqual(result["status"], "completed")
+        process.wait.assert_called_once_with(timeout=20)
+
+    def test_rejected_cancel_signal_still_waits_instead_of_abandoning_child(self):
+        cancelled = threading.Event()
+        process = self.process([json.dumps({"state": "watching_login"})])
+        process.send_signal.side_effect = OSError("synthetic Windows signal error")
+        result, _, _ = self.invoke(process, cancel_event=cancelled,
+            progress_cb=lambda event: cancelled.set())
+        self.assertTrue(result["cancelled"])
+        process.wait.assert_called_once_with(timeout=30)
+        process.kill.assert_not_called()
+        process.terminate.assert_not_called()
 
     def test_progress_values_cannot_smuggle_secrets_through_allowed_fields(self):
         malicious = {"state": "SECRET_SENTINEL", "verified_databases": "SECRET_SENTINEL",
@@ -251,8 +317,8 @@ class CaptureTests(unittest.TestCase):
         self.assertTrue(process.stdout.closed)
 
     def test_invalid_timeout_pid_and_missing_probe_do_not_spawn(self):
-        for kwargs in ({"timeout": 0}, {"timeout": 601}, {"timeout": True},
-                       {"pid": 0}, {"pid": -1}, {"pid": True},
+        for kwargs in ({"timeout": 0}, {"timeout": 601}, {"timeout": True}, {"timeout": 1.5},
+                       {"pid": 0}, {"pid": -1}, {"pid": True}, {"pid": "123"},
                        {"images_probe": self.root / "missing-probe"}):
             process = self.process()
             with patch.object(backend, "os", self.os_mock), \
@@ -260,6 +326,50 @@ class CaptureTests(unittest.TestCase):
                 with self.assertRaises(ExportError):
                     backend.capture_keys(self.config, **kwargs)
                 spawn.assert_not_called()
+
+
+class CaptureConsoleTests(unittest.TestCase):
+    @staticmethod
+    def windows(console_processes=0, allocated=True):
+        kernel = SimpleNamespace(GetConsoleProcessList=Mock(return_value=console_processes),
+            AllocConsole=Mock(return_value=allocated), GetConsoleWindow=Mock(return_value=123),
+            FreeConsole=Mock(return_value=True))
+        user = SimpleNamespace(ShowWindow=Mock(return_value=True))
+        def library(name, **kwargs):
+            return kernel if name == "kernel32" else user
+        return kernel, user, library
+
+    def test_windowed_capture_hides_owned_console_and_frees_only_after_context(self):
+        kernel, user, library = self.windows()
+        with patch.object(ctypes, "WinDLL", side_effect=library, create=True):
+            with backend._capture_console():
+                kernel.AllocConsole.assert_called_once_with()
+                user.ShowWindow.assert_called_once_with(123, 0)
+                kernel.FreeConsole.assert_not_called()
+            kernel.FreeConsole.assert_called_once_with()
+
+    def test_inherited_cli_console_is_never_hidden_or_freed(self):
+        kernel, user, library = self.windows(console_processes=1)
+        with patch.object(ctypes, "WinDLL", side_effect=library, create=True):
+            with backend._capture_console():
+                pass
+        kernel.AllocConsole.assert_not_called()
+        kernel.FreeConsole.assert_not_called()
+        user.ShowWindow.assert_not_called()
+
+    def test_alloc_console_failure_is_safe_and_owned_console_released_on_error(self):
+        kernel, user, library = self.windows(allocated=False)
+        with patch.object(ctypes, "WinDLL", side_effect=library, create=True):
+            with self.assertRaisesRegex(ExportError, "^capture_console_unavailable$"):
+                with backend._capture_console():
+                    self.fail("No child may be started without a shared console")
+        kernel.FreeConsole.assert_not_called()
+        kernel, user, library = self.windows()
+        with patch.object(ctypes, "WinDLL", side_effect=library, create=True):
+            with self.assertRaises(ValueError):
+                with backend._capture_console():
+                    raise ValueError("synthetic startup failure")
+        kernel.FreeConsole.assert_called_once_with()
 
 
 class SecurityAndStorageTests(unittest.TestCase):

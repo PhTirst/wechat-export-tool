@@ -4,16 +4,56 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import queue
 import re
 import shutil
 import signal
 import struct
 import subprocess
+import threading
 from pathlib import Path
+from contextlib import contextmanager
 
 from .config import ExportConfig
 from .errors import ExportError
 from .security import private_directory, private_text_writer, unprotect_bytes
+
+
+@contextmanager
+def _capture_console():
+    """Keep a hidden shared console available for a windowed GUI capture.
+
+    GenerateConsoleCtrlEvent only reaches groups sharing the caller's console.
+    An inherited CLI console belongs to the user and is never hidden or freed.
+    See Microsoft's AllocConsole and Console Process Groups documentation.
+    """
+    import ctypes
+    from ctypes import wintypes as wt
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.GetConsoleProcessList.argtypes = [ctypes.POINTER(wt.DWORD), wt.DWORD]
+    kernel.GetConsoleProcessList.restype = wt.DWORD
+    kernel.AllocConsole.argtypes = []
+    kernel.AllocConsole.restype = wt.BOOL
+    kernel.GetConsoleWindow.argtypes = []
+    kernel.GetConsoleWindow.restype = wt.HWND
+    kernel.FreeConsole.argtypes = []
+    kernel.FreeConsole.restype = wt.BOOL
+    processes = (wt.DWORD * 1)()
+    owned = not kernel.GetConsoleProcessList(processes, 1)
+    if owned:
+        if not kernel.AllocConsole():
+            raise ExportError("capture_console_unavailable")
+        window = kernel.GetConsoleWindow()
+        if window:
+            user = ctypes.WinDLL("user32", use_last_error=True)
+            user.ShowWindow.argtypes = [wt.HWND, ctypes.c_int]
+            user.ShowWindow.restype = wt.BOOL
+            user.ShowWindow(window, 0)  # SW_HIDE: only our newly allocated window.
+    try:
+        yield
+    finally:
+        if owned:
+            kernel.FreeConsole()
 
 
 def account_fingerprint(config: ExportConfig) -> str:
@@ -78,8 +118,13 @@ def load_page_keys(config: ExportConfig) -> dict[bytes, bytes]:
 
 
 def _capture_executable(config: ExportConfig) -> Path:
-    candidates = [config.capture_exe, shutil.which("wxmori-media"),
-                  Path.cwd() / "bin" / "wxmori-media.exe"]
+    from .runtime import apply_bundled_defaults
+    config = apply_bundled_defaults(config)
+    if config.capture_exe is not None:
+        if config.capture_exe.is_file():
+            return config.capture_exe.resolve()
+        raise ExportError("capture_executable_missing_run_build_capture")
+    candidates = [shutil.which("wxmori-media")]
     for candidate in candidates:
         if candidate and Path(candidate).is_file():
             return Path(candidate).resolve()
@@ -118,13 +163,25 @@ def prepare_image_probe(config: ExportConfig, conversation_id: str) -> Path:
 
 
 def capture_keys(config: ExportConfig, *, timeout: int = 180,
-                 pid: int | None = None, images_probe: Path | None = None) -> dict:
+                 pid: int | None = None, images_probe: Path | None = None,
+                 cancel_event=None, progress_cb=None) -> dict:
+    """Supervise explicit capture until the debugger has detached.
+
+    ``cancel_event`` may be a threading.Event supplied by the desktop UI.
+    Progress callbacks receive only validated public status fields; this API
+    never writes to stdout, which may not exist in a windowed executable.
+    Cancellation requests a graceful Ctrl+Break and never kills the debugger.
+    """
     if os.name != "nt":
         raise ExportError("capture_requires_windows")
-    if isinstance(timeout, bool) or not 1 <= timeout <= 600:
+    if type(timeout) is not int or not 1 <= timeout <= 600:
         raise ExportError("capture_timeout_invalid")
-    if pid is not None and (isinstance(pid, bool) or not 0 < pid <= 0xffffffff):
+    if pid is not None and (type(pid) is not int or not 0 < pid <= 0xffffffff):
         raise ExportError("capture_pid_invalid")
+    if cancel_event is not None and cancel_event.is_set():
+        return {"returncode": 130, "status": "stopped", "cancelled": True,
+                "verified_databases": 0, "required_databases": 0,
+                "image_candidate_saved": False}
     if not (config.account_root / "db_storage").is_dir():
         raise ExportError("account_database_directory_missing")
     executable = _capture_executable(config)
@@ -150,46 +207,109 @@ def capture_keys(config: ExportConfig, *, timeout: int = 180,
               "stopped", "failed", "unsupported", "waiting_for_databases", "settling",
               "access_denied", "arming_login_capture", "account_mismatch"}
     last = {}
-    process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                               stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
-                               errors="replace", env=environment,
-                               creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
-    try:
-        for line in process.stdout:
+    cancelled = False
+    events = queue.Queue()
+
+    def notify(clean):
+        if progress_cb is not None:
             try:
-                event = json.loads(line)
-            except ValueError:
-                continue
-            if not isinstance(event, dict) or "state" not in event:
-                continue
-            clean = {}
-            if isinstance(event.get("state"), str) and event["state"] in states:
-                clean["state"] = event["state"]
-            for key in ("running", "ready_for_login", "image_probe_enabled", "image_key_captured"):
-                if type(event.get(key)) is bool:
-                    clean[key] = event[key]
-            for key in ("verified_databases", "required_databases"):
-                value = event.get(key)
-                if type(value) is int and 0 <= value <= 0xffffffff:
-                    clean[key] = value
-            if clean != last:
-                print(json.dumps({"capture": clean}, ensure_ascii=False), flush=True)
-                last = clean
-        returncode = process.wait(timeout=20)
-    except KeyboardInterrupt:
-        # Let the debugger restore thread registers and detach before exiting.
-        process.send_signal(signal.CTRL_BREAK_EVENT)
-        process.wait(timeout=30)
-        raise
-    finally:
-        if process.stdout:
-            process.stdout.close()
+                progress_cb(dict(clean))
+            except Exception:
+                # A UI callback must not abandon a debugger still attached to
+                # WeChat. Lifecycle supervision remains independent of the UI.
+                pass
+
+    with _capture_console():
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
+                                   errors="replace", env=environment,
+                                   creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+
+        def read_output():
+            try:
+                for line in process.stdout:
+                    events.put(("line", line))
+            except BaseException as exc:
+                events.put(("error", exc))
+            finally:
+                events.put(("eof", None))
+
+        def graceful_stop():
+            try:
+                process.send_signal(signal.CTRL_BREAK_EVENT)
+            except OSError:
+                # If Windows rejects a signal, keep supervising until the
+                # capture's own timeout performs its normal detach path.
+                notify({"state": "stopping", "running": True})
+            while True:
+                try:
+                    # Never force-terminate an attached debugger. If detachment
+                    # takes longer, keep the job alive so the UI cannot silently
+                    # abandon the child process when its window closes.
+                    return process.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    notify({"state": "stopping", "running": True})
+                except KeyboardInterrupt:
+                    # Repeated Ctrl+C still must allow debug-register restoration.
+                    continue
+
+        reader = threading.Thread(target=read_output, name="capture-progress", daemon=True)
+        try:
+            reader.start()
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    cancelled = True
+                    notify({"state": "stopping", "running": True})
+                    returncode = graceful_stop()
+                    break
+                try:
+                    kind, line = events.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if kind == "error":
+                    raise line
+                if kind == "eof":
+                    returncode = process.wait(timeout=20)
+                    break
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(event, dict) or "state" not in event:
+                    continue
+                clean = {}
+                if isinstance(event.get("state"), str) and event["state"] in states:
+                    clean["state"] = event["state"]
+                for key in ("running", "ready_for_login", "image_probe_enabled", "image_key_captured"):
+                    if type(event.get(key)) is bool:
+                        clean[key] = event[key]
+                for key in ("verified_databases", "required_databases"):
+                    value = event.get(key)
+                    if type(value) is int and 0 <= value <= 0xffffffff:
+                        clean[key] = value
+                if clean != last:
+                    notify(clean)
+                    last = clean
+        except KeyboardInterrupt:
+            # Let the debugger restore thread registers and detach before exiting.
+            graceful_stop()
+            raise
+        except Exception:
+            graceful_stop()
+            raise ExportError("capture_supervision_failed") from None
+        finally:
+            if process.stdout:
+                process.stdout.close()
+            if reader.ident is not None:
+                reader.join(timeout=1)
     candidate = directory / "image-candidate.dpapi.json"
     if candidate.is_file() and images_probe is not None:
         # Promotion needs an explicit conversation; normal export validates this
         # candidate against that conversation before accepting any image key.
         last["image_candidate_saved"] = True
-    return {"returncode": returncode, "status": last.get("state", "failed"),
+    return {"returncode": 130 if cancelled else returncode,
+            "status": "stopped" if cancelled else last.get("state", "failed"),
+            "cancelled": cancelled,
             "verified_databases": last.get("verified_databases", 0),
             "required_databases": last.get("required_databases", 0),
             "image_candidate_saved": last.get("image_candidate_saved", False)}

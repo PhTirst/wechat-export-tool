@@ -33,8 +33,14 @@ def cli_environment(tmp_path, monkeypatch):
     engine.export_conversation = export
     backend = types.ModuleType("wechat_export_tool.backend")
     backend.capture_keys = lambda settings, **kwargs: {"completed": True}
+    runtime = types.ModuleType("wechat_export_tool.runtime")
+    runtime.apply_bundled_defaults = lambda settings: settings
+    runtime.without_bundled_defaults = lambda settings: settings
+    runtime.runtime_report = lambda settings=None: {"schema_version": 1, "version": "synthetic-version",
+        "frozen": False, "tools": {"capture": {"available": False}}, "capabilities": {}}
     monkeypatch.setitem(sys.modules, "wechat_export_tool.engine", engine)
     monkeypatch.setitem(sys.modules, "wechat_export_tool.backend", backend)
+    monkeypatch.setitem(sys.modules, "wechat_export_tool.runtime", runtime)
 
     def invoke(arguments, input_stream=None):
         stdout, stderr = io.StringIO(), io.StringIO()
@@ -139,7 +145,9 @@ def test_capture_is_delegated_with_explicit_scoping_and_redacts_key_fields(cli_e
     probe = env.tmp / "ciphertext-only.json"
     code, output, error = env.invoke(["capture", "--timeout", "45", "--pid", "1234", "--images-probe", str(probe)])
     assert code == 0 and not error
-    assert captured == [{"timeout": 45, "pid": 1234, "images_probe": probe}]
+    assert {key: value for key, value in captured[0].items() if key != "progress_cb"} == {
+        "timeout": 45, "pid": 1234, "images_probe": probe}
+    assert callable(captured[0]["progress_cb"])
     assert "synthetic_secret" not in output
     assert "[redacted]" in output
 
@@ -195,3 +203,90 @@ def test_untrusted_contact_display_cannot_inject_terminal_escape(cli_environment
         Conversation("stable_id", "name\x1b[31m\nnext", "contact")]
     code, output, _ = cli_environment.invoke(["conversations"])
     assert code == 0 and "\x1b" not in output
+
+
+def test_doctor_does_not_import_engine_or_scan_accounts(cli_environment, monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("doctor must not load the database engine")
+    monkeypatch.setattr("wechat_export_tool.cli.importlib.import_module", forbidden)
+    code, output, error = cli_environment.invoke(["doctor", "--json"])
+    report = json.loads(output)
+    assert code == 0 and not error
+    assert report["version"] == "synthetic-version"
+    assert report["tools"]["capture"]["available"] is False
+    assert report["json_contract"]["stdout"] == "one_json_value"
+    assert report["json_contract"]["encoding"] == "utf-8"
+    assert report["json_contract"]["interactive"] is False
+    assert "export" in report["commands"]
+
+
+@pytest.mark.parametrize("arguments,exit_code,error_code", [
+    (["export", "--master-key", "synthetic_secret", "--json"], 2, "invalid_arguments"),
+    (["--json", "capture", "--timeout", "601"], 2, "invalid_arguments"),
+])
+def test_json_usage_errors_are_single_safe_machine_readable_results(cli_environment, arguments, exit_code, error_code):
+    code, output, error = cli_environment.invoke(arguments)
+    result = json.loads(output)
+    assert code == exit_code and not error
+    assert result["ok"] is False and result["schema_version"] == 1
+    assert result["error"]["code"] == error_code
+    assert "synthetic_secret" not in output
+
+
+def test_json_operation_error_and_cancellation_are_machine_readable(cli_environment):
+    env = cli_environment
+    def failure(*args, **kwargs):
+        raise RuntimeError("synthetic_secret")
+    env.engine.export_conversation = failure
+    code, output, error = env.invoke(["--json", "export", "--conversation-id", "stable_id"])
+    assert code == 1 and not error
+    assert json.loads(output)["error"]["code"] == "operation_failed"
+    assert "synthetic_secret" not in output
+    def cancel(*args, **kwargs):
+        raise KeyboardInterrupt
+    env.backend.capture_keys = cancel
+    code, output, error = env.invoke(["capture", "--json"])
+    assert code == 130 and not error
+    assert json.loads(output)["error"]["code"] == "cancelled"
+
+
+def test_json_capture_progress_stays_on_stderr_and_result_is_single_json(cli_environment):
+    def capture(settings, **kwargs):
+        kwargs["progress_cb"]({"state": "watching_login", "key": "synthetic_secret"})
+        return {"returncode": 0, "status": "completed"}
+    cli_environment.backend.capture_keys = capture
+    code, output, error = cli_environment.invoke(["capture", "--json"])
+    assert code == 0
+    assert json.loads(output) == {"returncode": 0, "status": "completed"}
+    assert json.loads(error)["capture"]["state"] == "watching_login"
+    assert "synthetic_secret" not in error
+
+
+def test_config_set_does_not_persist_portable_bundle_paths(cli_environment):
+    runtime = sys.modules["wechat_export_tool.runtime"]
+    stripped = []
+    def portable_settings(settings):
+        stripped.append(settings)
+        return replace(settings, capture_exe=None)
+    runtime.without_bundled_defaults = portable_settings
+    code, output, error = cli_environment.invoke(["config", "set", "--capture-exe",
+        str(cli_environment.tmp / "portable/runtime/capture/wxmori-media.exe")])
+    assert code == 0 and not error and stripped
+    assert load_config(cli_environment.path).capture_exe is None
+
+
+def test_real_console_pipes_use_utf8_and_injected_streams_are_untouched(monkeypatch):
+    class Pipe(io.StringIO):
+        def __init__(self):
+            super().__init__()
+            self.settings = []
+        def reconfigure(self, **settings):
+            self.settings.append(settings)
+    pipe_out, pipe_error = Pipe(), Pipe()
+    monkeypatch.setattr(sys, "stdout", pipe_out)
+    monkeypatch.setattr(sys, "stderr", pipe_error)
+    assert main(["--help"]) == 0
+    assert pipe_out.settings == pipe_error.settings == [{"encoding": "utf-8", "errors": "replace"}]
+    pipe_out.settings.clear(); pipe_error.settings.clear()
+    assert main(["--help"], stdout=io.StringIO(), stderr=io.StringIO()) == 0
+    assert pipe_out.settings == pipe_error.settings == []
