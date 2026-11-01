@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
 import tempfile
@@ -93,7 +95,9 @@ class VoiceLookupTests(unittest.TestCase):
 class VoiceCollectionTests(unittest.TestCase):
     def test_one_frozen_copy_set_and_one_batch_with_explicit_keys(self):
         with tempfile.TemporaryDirectory(prefix="synthetic-voice-collect-") as temp:
-            root = Path(temp)
+            # Windows TEMP may use an 8.3 alias (for example on hosted CI).
+            # Match the collector's canonical account paths in the mock map.
+            root = Path(temp).resolve()
             account, output, scratch = root / "account", root / "output", root / "scratch"
             media = account / "db_storage/message"
             media.mkdir(parents=True)
@@ -150,6 +154,27 @@ class VoiceCollectionTests(unittest.TestCase):
             self.assertTrue(voice._verify_wave(output / relative))
             self.assertEqual({source: source.read_bytes() for source in source_before}, source_before)
             self.assertEqual(progress[-1]["stage"], "voice_complete")
+
+    @unittest.skipUnless(os.name == "nt", "Windows short-path aliases only")
+    def test_frozen_copy_accepts_short_temporary_directory_alias(self):
+        original = tempfile.TemporaryDirectory
+
+        @contextlib.contextmanager
+        def short_directory(*args, **kwargs):
+            with original(*args, **kwargs) as name:
+                from ctypes import wintypes
+                kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+                get_short_path = kernel.GetShortPathNameW
+                get_short_path.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+                get_short_path.restype = wintypes.DWORD
+                buffer = ctypes.create_unicode_buffer(32768)
+                size = get_short_path(name, buffer, len(buffer))
+                if not 0 < size < len(buffer) or buffer.value == str(Path(name).resolve()):
+                    self.skipTest("8.3 path aliases are unavailable on this filesystem")
+                yield buffer.value
+
+        with patch.object(tempfile, "TemporaryDirectory", side_effect=short_directory):
+            self.test_one_frozen_copy_set_and_one_batch_with_explicit_keys()
 
     def test_scope_and_duplicate_identity_fail_without_source_access(self):
         with patch.object(voice, "frozen_families") as frozen:
