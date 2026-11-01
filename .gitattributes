@@ -1,0 +1,5 @@
+* text=auto eol=lf
+*.patch -whitespace
+*.png binary
+*.jpg binary
+*.gif binary

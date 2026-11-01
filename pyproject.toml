@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wechat-export-tool"
+version = "0.1.0"
+description = "Windows WeChat conversation export with local JSON and offline media viewer"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "GPL-3.0-only"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "licenses/*"]
+authors = [{name = "PhTirst"}]
+dependencies = [
+  "chatlog-keeper @ git+https://github.com/labazhou2024/chatlog-keeper.git@2225294fd0761e10ce15540f21e7dbb2ac304c3c",
+  "Pillow>=10",
+  "pycryptodome>=3.18",
+  "numpy>=1.24",
+  "zstandard>=0.20",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "build>=1.2"]
+
+[project.scripts]
+wechat-export = "wechat_export_tool.cli:main"
+
+[project.urls]
+Repository = "https://github.com/PhTirst/wechat-export-tool"
+Issues = "https://github.com/PhTirst/wechat-export-tool/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+wechat_export_tool = ["assets/*.cjs"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

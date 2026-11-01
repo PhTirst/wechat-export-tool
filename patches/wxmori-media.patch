@@ -1,0 +1,1220 @@
+diff --git a/internal/keycapture/capture_pid_test.go b/internal/keycapture/capture_pid_test.go
+new file mode 100644
+index 0000000..6b26d65
+--- /dev/null
++++ b/internal/keycapture/capture_pid_test.go
+@@ -0,0 +1,33 @@
++package keycapture
++
++import "testing"
++
++func TestCapturePIDIsOptInAndStrictPositiveUint32(t *testing.T) {
++	for _, value := range []string{"0", "-1", "+1", "12.0", "1x", "4294967296"} {
++		t.Setenv("WXMORI_CAPTURE_PID", value)
++		if _, err := capturePIDFromEnvironment(); err == nil {
++			t.Fatal("invalid capture PID was accepted")
++		}
++	}
++	t.Setenv("WXMORI_CAPTURE_PID", "12345")
++	if selected, err := capturePIDFromEnvironment(); err != nil || selected != 12345 {
++		t.Fatal("explicit positive capture PID was not selected")
++	}
++	t.Setenv("WXMORI_CAPTURE_PID", "")
++	if selected, err := capturePIDFromEnvironment(); err != nil || selected != 0 {
++		t.Fatal("unset capture PID changed default enumeration")
++	}
++}
++
++func TestCapturePIDRestrictsOnlyPreviouslyEnumeratedSyntheticProcesses(t *testing.T) {
++	first, second := &process{pid: 1001}, &process{pid: 1002}
++	if selected := restrictCaptureProcesses([]*process{first, second}, 1002); len(selected) != 1 || selected[0] != second {
++		t.Fatal("explicit PID did not isolate the enumerated synthetic process")
++	}
++	if selected := restrictCaptureProcesses([]*process{first, second}, 9999); len(selected) != 0 {
++		t.Fatal("missing explicit PID fell back to another process")
++	}
++	if selected := restrictCaptureProcesses([]*process{first, second}, 0); len(selected) != 2 {
++		t.Fatal("default enumeration was restricted")
++	}
++}
+diff --git a/internal/keycapture/image_completion_windows_test.go b/internal/keycapture/image_completion_windows_test.go
+new file mode 100644
+index 0000000..0fc68cc
+--- /dev/null
++++ b/internal/keycapture/image_completion_windows_test.go
+@@ -0,0 +1,58 @@
++//go:build windows
++
++package keycapture
++
++import (
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/axiomzero-qed/WxMori/internal/config"
++	"github.com/axiomzero-qed/WxMori/internal/keyring"
++)
++
++func TestCachedDatabasesStillEnterWatcherForRequestedImage(t *testing.T) {
++	dir := t.TempDir()
++	target, key := fixtureTarget()
++	for _, name := range []string{"contact.db", "message_0.db"} {
++		if err := os.WriteFile(filepath.Join(dir, name), target.Page, 0600); err != nil {
++			t.Fatal(err)
++		}
++	}
++	configuration := config.Config{DataDir: dir, Path: filepath.Join(t.TempDir(), "config.json")}
++	if err := keyring.SaveCaptured(configuration.CapturedKeyFile(), keyring.AccountID(dir), map[[16]byte][32]byte{target.Salt: key}); err != nil {
++		t.Fatal(err)
++	}
++	var imageKey [16]byte
++	header, ciphertext, _ := syntheticImageSample(t, imageKey, append([]byte("\x89PNG\r\n\x1a\n"), make([]byte, 32)...))
++	probe, _ := json.Marshal(map[string]any{"version": 1, "samples": []map[string]string{{"header_hex": header, "ciphertext_base64": ciphertext}}})
++	probePath := filepath.Join(t.TempDir(), "probe.json")
++	if err := os.WriteFile(probePath, probe, 0600); err != nil {
++		t.Fatal(err)
++	}
++	t.Setenv("WXMORI_IMAGE_PROBE", probePath)
++	t.Setenv("WXMORI_IMAGE_KEY_FILE", filepath.Join(t.TempDir(), "image.json"))
++	manager := New(configuration)
++	defer manager.Close()
++	var enumerations atomic.Int32
++	// Synthetic empty enumeration must never inspect any real user's process.
++	manager.enumerate = func() ([]*process, int, error) {
++		enumerations.Add(1)
++		return nil, 0, nil
++	}
++	status, err := manager.Start(time.Second)
++	if err != nil || !status.ImageProbeEnabled {
++		t.Fatal("explicit image opt-in was not present at startup")
++	}
++	deadline := time.Now().Add(4 * time.Second)
++	for manager.Status().Running && time.Now().Before(deadline) {
++		time.Sleep(20 * time.Millisecond)
++	}
++	status = manager.Status()
++	if status.Running || status.State == "completed" || status.ImageKeyCaptured || status.VerifiedDatabases != 2 || enumerations.Load() == 0 {
++		t.Fatal("cached complete databases incorrectly skipped the outstanding image watcher")
++	}
++}
+diff --git a/internal/keycapture/image_probe.go b/internal/keycapture/image_probe.go
+new file mode 100644
+index 0000000..6ba0b74
+--- /dev/null
++++ b/internal/keycapture/image_probe.go
+@@ -0,0 +1,175 @@
++package keycapture
++
++import (
++	"bytes"
++	"crypto/aes"
++	"encoding/base64"
++	"encoding/binary"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"io"
++	"os"
++
++	"github.com/axiomzero-qed/WxMori/internal/keyring"
++)
++
++const maxImageProbeBytes = 16 << 20
++
++type imageProbeSample struct {
++	plainLength int
++	ciphertext  []byte
++}
++
++type imageProbe struct {
++	samples  []imageProbeSample
++	output   string
++	seen     map[[16]byte]bool
++	captured bool
++}
++
++// The explicit probe contains only a 15-byte V2 container header and the entire
++// padded AES ciphertext section. It contains neither a key nor an image path.
++type imageProbeJSON struct {
++	Version int `json:"version"`
++	Samples []struct {
++		HeaderHex        string `json:"header_hex"`
++		CiphertextBase64 string `json:"ciphertext_base64"`
++	} `json:"samples"`
++}
++
++func decodeImageProbe(reader io.Reader, output string) (*imageProbe, error) {
++	data, err := io.ReadAll(io.LimitReader(reader, maxImageProbeBytes+1))
++	if err != nil || len(data) > maxImageProbeBytes {
++		return nil, errors.New("invalid image probe size")
++	}
++	defer clear(data)
++	decoder := json.NewDecoder(bytes.NewReader(data))
++	decoder.DisallowUnknownFields()
++	var document imageProbeJSON
++	if decoder.Decode(&document) != nil || decoder.Decode(new(any)) != io.EOF || document.Version != 1 || len(document.Samples) == 0 || len(document.Samples) > 8 {
++		return nil, errors.New("invalid image probe format")
++	}
++	probe := &imageProbe{output: output, seen: map[[16]byte]bool{}}
++	total := 0
++	for _, sample := range document.Samples {
++		header, e := hex.DecodeString(sample.HeaderHex)
++		if e != nil || len(header) != 15 || !bytes.Equal(header[:6], []byte{7, 8, 'V', '2', 8, 7}) {
++			probe.clear()
++			return nil, errors.New("invalid image probe header")
++		}
++		length := int(binary.LittleEndian.Uint32(header[6:10]))
++		ciphertext, e := base64.StdEncoding.DecodeString(sample.CiphertextBase64)
++		if e != nil || length < 1 || length > 2<<20 || len(ciphertext) != length+(aes.BlockSize-length%aes.BlockSize) {
++			clear(ciphertext)
++			probe.clear()
++			return nil, errors.New("invalid image probe ciphertext")
++		}
++		total += len(ciphertext)
++		if total > 8<<20 {
++			clear(ciphertext)
++			probe.clear()
++			return nil, errors.New("image probe budget exceeded")
++		}
++		probe.samples = append(probe.samples, imageProbeSample{length, ciphertext})
++	}
++	return probe, nil
++}
++
++func imageProbeFromEnvironment() (*imageProbe, error) {
++	path, output := os.Getenv("WXMORI_IMAGE_PROBE"), os.Getenv("WXMORI_IMAGE_KEY_FILE")
++	if path == "" && output == "" {
++		return nil, nil
++	}
++	if path == "" || output == "" {
++		return nil, errors.New("both image probe environment variables are required")
++	}
++	file, err := os.Open(path)
++	if err != nil {
++		return nil, errors.New("image probe could not be read")
++	}
++	defer file.Close()
++	return decodeImageProbe(file, output)
++}
++
++func imageProbeConfigured() bool {
++	return os.Getenv("WXMORI_IMAGE_PROBE") != "" || os.Getenv("WXMORI_IMAGE_KEY_FILE") != ""
++}
++
++func captureGoalsComplete(databaseComplete, imageEnabled, imageCaptured bool) bool {
++	return databaseComplete && (!imageEnabled || imageCaptured)
++}
++
++func (m *Manager) goalsComplete(databaseComplete bool) bool {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	return captureGoalsComplete(databaseComplete, m.status.ImageProbeEnabled, m.status.ImageKeyCaptured)
++}
++
++func (p *imageProbe) clear() {
++	for i := range p.samples {
++		clear(p.samples[i].ciphertext)
++	}
++	p.samples = nil
++	clear(p.seen)
++}
++
++func imageHeader(plain []byte) bool {
++	if len(plain) < 16 {
++		return false
++	}
++	jpeg := plain[0] == 0xff && plain[1] == 0xd8 && plain[2] == 0xff && plain[3] >= 0xc0 && plain[3] != 0xff && plain[3] != 0xd8 && plain[3] != 0xd9
++	return jpeg || bytes.HasPrefix(plain, []byte("\x89PNG\r\n\x1a\n")) || bytes.HasPrefix(plain, []byte("GIF87a")) || bytes.HasPrefix(plain, []byte("GIF89a")) || (bytes.Equal(plain[:4], []byte("RIFF")) && bytes.Equal(plain[8:12], []byte("WEBP"))) || bytes.HasPrefix(plain, []byte("wxgf"))
++}
++
++// verifiesImageKey validates header, every encrypted block, the whole PKCS7
++// padding, and the exact unpadded length from the supplied V2 header. V2 has no
++// authentication tag; callers must still confirm the complete decoded image.
++func (p *imageProbe) verifiesImageKey(key [16]byte) bool {
++	block, err := aes.NewCipher(key[:])
++	if err != nil {
++		return false
++	}
++	for _, sample := range p.samples {
++		var first [aes.BlockSize]byte
++		block.Decrypt(first[:], sample.ciphertext[:aes.BlockSize])
++		matches := imageHeader(first[:])
++		clear(first[:])
++		if !matches {
++			continue
++		}
++		plain := make([]byte, len(sample.ciphertext))
++		for offset := 0; offset < len(plain); offset += aes.BlockSize {
++			block.Decrypt(plain[offset:offset+aes.BlockSize], sample.ciphertext[offset:offset+aes.BlockSize])
++		}
++		padding := int(plain[len(plain)-1])
++		valid := padding >= 1 && padding <= aes.BlockSize && len(plain)-padding == sample.plainLength
++		if valid {
++			for _, value := range plain[len(plain)-padding:] {
++				if int(value) != padding {
++					valid = false
++				}
++			}
++		}
++		clear(plain)
++		if valid {
++			return true
++		}
++	}
++	return false
++}
++
++func (p *imageProbe) observe(key [16]byte) (bool, error) {
++	if p.captured || p.seen[key] || len(p.seen) >= 8192 {
++		return false, nil
++	}
++	p.seen[key] = true
++	if !p.verifiesImageKey(key) {
++		return false, nil
++	}
++	if err := keyring.SaveImageCandidate(p.output, key); err != nil {
++		return false, errors.New("image candidate could not be protected")
++	}
++	p.captured = true
++	return true, nil
++}
+diff --git a/internal/keycapture/image_probe_test.go b/internal/keycapture/image_probe_test.go
+new file mode 100644
+index 0000000..73236aa
+--- /dev/null
++++ b/internal/keycapture/image_probe_test.go
+@@ -0,0 +1,111 @@
++package keycapture
++
++import (
++	"bytes"
++	"crypto/aes"
++	"encoding/base64"
++	"encoding/binary"
++	"encoding/hex"
++	"encoding/json"
++	"testing"
++)
++
++func syntheticImageSample(t *testing.T, key [16]byte, plaintext []byte) (string, string, []byte) {
++	t.Helper()
++	header := make([]byte, 15)
++	copy(header, []byte{7, 8, 'V', '2', 8, 7})
++	binary.LittleEndian.PutUint32(header[6:], uint32(len(plaintext)))
++	padding := aes.BlockSize - len(plaintext)%aes.BlockSize
++	padded := append(append([]byte(nil), plaintext...), bytes.Repeat([]byte{byte(padding)}, padding)...)
++	block, err := aes.NewCipher(key[:])
++	if err != nil {
++		t.Fatal(err)
++	}
++	ciphertext := make([]byte, len(padded))
++	for i := 0; i < len(padded); i += aes.BlockSize {
++		block.Encrypt(ciphertext[i:i+aes.BlockSize], padded[i:i+aes.BlockSize])
++	}
++	return hex.EncodeToString(header), base64.StdEncoding.EncodeToString(ciphertext), ciphertext
++}
++
++func TestImageProbeValidatesFullSectionAndPadding(t *testing.T) {
++	var key [16]byte
++	for i := range key {
++		key[i] = byte(i + 41)
++	}
++	for _, prefix := range [][]byte{
++		{0xff, 0xd8, 0xff, 0xe0}, []byte("\x89PNG\r\n\x1a\n"), []byte("GIF87a"), []byte("GIF89a"), []byte("RIFF0000WEBP"), []byte("wxgf"),
++	} {
++		plain := append(append([]byte(nil), prefix...), bytes.Repeat([]byte{0x5a}, 64)...)
++		header, ciphertext, _ := syntheticImageSample(t, key, plain)
++		document := imageProbeJSON{Version: 1}
++		document.Samples = append(document.Samples, struct {
++			HeaderHex        string `json:"header_hex"`
++			CiphertextBase64 string `json:"ciphertext_base64"`
++		}{header, ciphertext})
++		encoded, _ := json.Marshal(document)
++		probe, err := decodeImageProbe(bytes.NewReader(encoded), "not-used")
++		if err != nil {
++			t.Fatal(err)
++		}
++		if !probe.verifiesImageKey(key) {
++			t.Fatal("valid synthetic format was rejected")
++		}
++		wrong := key
++		wrong[0] ^= 1
++		if probe.verifiesImageKey(wrong) {
++			t.Fatal("wrong key was accepted")
++		}
++		// Keep the valid first block while deterministically invalidating only
++		// the final block's PKCS7 padding. Prefix-only acceptance must fail.
++		block, _ := aes.NewCipher(key[:])
++		last := make([]byte, aes.BlockSize)
++		last[len(last)-1] = 0
++		at := len(probe.samples[0].ciphertext) - aes.BlockSize
++		block.Encrypt(probe.samples[0].ciphertext[at:], last)
++		if probe.verifiesImageKey(key) {
++			t.Fatal("invalid full-section padding was accepted")
++		}
++		probe.clear()
++	}
++}
++
++func TestImageProbeRejectsMalformedOrUnrelatedCiphertext(t *testing.T) {
++	for _, input := range []string{
++		`{}`, `{"version":1,"samples":[]}`, `{"version":2,"samples":[{}]}`,
++		`{"version":1,"samples":[{"header_hex":"00","ciphertext_base64":"AA=="}]}`,
++		`{"version":1,"samples":[{}],"unexpected":true}`,
++	} {
++		if probe, err := decodeImageProbe(bytes.NewBufferString(input), "unused"); err == nil {
++			probe.clear()
++			t.Fatal("malformed synthetic probe accepted")
++		}
++	}
++	var key [16]byte
++	_, _, encrypted := syntheticImageSample(t, key, bytes.Repeat([]byte{'x'}, 32))
++	probe := &imageProbe{samples: []imageProbeSample{{32, encrypted}}}
++	if probe.verifiesImageKey(key) {
++		t.Fatal("valid padding without an image header was accepted")
++	}
++}
++
++func TestCaptureCompletionRequiresRequestedImage(t *testing.T) {
++	for _, databasesComplete := range []bool{false, true} {
++		for _, enabled := range []bool{false, true} {
++			for _, captured := range []bool{false, true} {
++				expected := databasesComplete && (!enabled || captured)
++				if got := captureGoalsComplete(databasesComplete, enabled, captured); got != expected {
++					t.Fatal("capture completed with an outstanding requested goal")
++				}
++			}
++		}
++	}
++	manager := &Manager{status: Status{ImageProbeEnabled: true}}
++	if manager.goalsComplete(true) {
++		t.Fatal("cached database keys bypassed requested image capture")
++	}
++	manager.status.ImageKeyCaptured = true
++	if !manager.goalsComplete(true) {
++		t.Fatal("verified image and complete databases did not complete")
++	}
++}
+diff --git a/internal/keycapture/login_windows_amd64.go b/internal/keycapture/login_windows_amd64.go
+index e7cb733..f659abe 100644
+--- a/internal/keycapture/login_windows_amd64.go
++++ b/internal/keycapture/login_windows_amd64.go
+@@ -83,6 +83,16 @@ func loginAddresses(p *process) ([]uintptr, error) {
+ var captureComplete = errors.New("required keys verified")
+ 
+ func (m *Manager) watchLogin(ctx context.Context, processes []*process, keys map[[16]byte][32]byte) (bool, error) {
++	image, imageErr := imageProbeFromEnvironment()
++	if imageErr != nil {
++		return true, fault.New("IMAGE_PROBE_INVALID", "图片密文探针无效 / Invalid image ciphertext probe", "Check the explicit image probe JSON and protected output environment variables.")
++	}
++	if image != nil {
++		defer image.clear()
++		m.mu.Lock()
++		m.status.ImageProbeEnabled = true
++		m.mu.Unlock()
++	}
+ 	for _, p := range processes {
+ 		addresses, err := loginAddresses(p)
+ 		if err != nil || len(addresses) == 0 {
+@@ -109,6 +119,21 @@ func (m *Manager) watchLogin(ctx context.Context, processes []*process, keys map
+ 		stableSince := time.Now()
+ 		lastRefresh := time.Time{}
+ 		var operationErr error
++		var observeImage func([16]byte)
++		if image != nil {
++			observeImage = func(key [16]byte) {
++				defer clear(key[:])
++				captured, e := image.observe(key)
++				if e != nil {
++					operationErr = fault.New("IMAGE_KEY_SAVE_FAILED", "无法保护图片候选密钥 / Could not protect image key candidate", "Check the explicit protected image output path and Windows user protection.")
++				}
++				if captured {
++					m.mu.Lock()
++					m.status.ImageKeyCaptured = true
++					m.mu.Unlock()
++				}
++			}
++		}
+ 		refresh := func() error {
+ 			if operationErr != nil {
+ 				return operationErr
+@@ -174,15 +199,18 @@ func (m *Manager) watchLogin(ctx context.Context, processes []*process, keys map
+ 					hasMessage = true
+ 				}
+ 			}
+-			if hasContact && hasMessage && validKeys(ts, keys) == len(ts) {
++			databasesComplete := hasContact && hasMessage && validKeys(ts, keys) == len(ts)
++			if m.goalsComplete(databasesComplete) {
+ 				if time.Since(stableSince) >= 5*time.Second {
+ 					return captureComplete
+ 				}
+ 				m.setState("settling", "Keys authenticated; waiting for the database list to settle. / 密钥已校验，等待数据库列表稳定。")
++			} else if databasesComplete && image != nil && !image.captured {
++				m.setState("watching_images", "Database keys are ready; keep the watcher running and open a target picture locally. / 数据库密钥已齐，监听仍在运行，请在微信中重新打开目标图片。")
+ 			}
+ 			return nil
+ 		}
+-		err = windebug.Watch(ctx, p.pid, addresses, func() {
++		err = windebug.WatchWithImage(ctx, p.pid, addresses, func() {
+ 			m.mu.Lock()
+ 			m.status.ReadyForLogin = true
+ 			m.mu.Unlock()
+@@ -209,7 +237,7 @@ func (m *Manager) watchLogin(ctx context.Context, processes []*process, keys map
+ 			m.mu.Lock()
+ 			m.status.Candidates = probe.Candidates
+ 			m.mu.Unlock()
+-		}, refresh)
++		}, observeImage, refresh)
+ 		if errors.Is(err, captureComplete) {
+ 			m.setState("completed", "All required database keys were authenticated and saved locally, and the login watcher detached. Close WeChat normally before export if encrypted WAL exists. / 所需数据库密钥均已校验并保存，临时调试已解除；若存在加密 WAL，请正常关闭微信后导出。")
+ 			return true, nil
+diff --git a/internal/keycapture/manager.go b/internal/keycapture/manager.go
+index c036847..7b8e8db 100644
+--- a/internal/keycapture/manager.go
++++ b/internal/keycapture/manager.go
+@@ -13,6 +13,8 @@ import (
+ 	"path/filepath"
+ 	"regexp"
+ 	"sort"
++	"strconv"
++	"strings"
+ 	"sync"
+ 	"time"
+ 
+@@ -35,6 +37,8 @@ type Status struct {
+ 	Passes            int            `json:"passes"`
+ 	Candidates        int            `json:"candidate_count"`
+ 	KeySetupEvents    int            `json:"key_setup_events"`
++	ImageProbeEnabled bool           `json:"image_probe_enabled,omitempty"`
++	ImageKeyCaptured  bool           `json:"image_key_captured,omitempty"`
+ 	ObservedAccounts  []AccountMatch `json:"observed_account_matches,omitempty"`
+ 	BytesRead         uint64         `json:"bytes_read"`
+ 	StartedAt         string         `json:"started_at,omitempty"`
+@@ -44,13 +48,14 @@ type Status struct {
+ 	Error             *fault.Error   `json:"error,omitempty"`
+ }
+ type Manager struct {
+-	mu        sync.Mutex
+-	c         config.Config
+-	status    Status
+-	cancel    context.CancelFunc
+-	done      chan struct{}
+-	enumerate func() ([]*process, int, error)
+-	mode      string
++	mu         sync.Mutex
++	c          config.Config
++	status     Status
++	cancel     context.CancelFunc
++	done       chan struct{}
++	enumerate  func() ([]*process, int, error)
++	mode       string
++	capturePID uint32
+ }
+ 
+ func New(c config.Config) *Manager {
+@@ -81,14 +86,56 @@ func (m *Manager) StartWithMode(timeout time.Duration, mode string) (Status, err
+ 	if mode != "auto" && mode != "read_only" {
+ 		return m.status, fault.New("INVALID_CAPTURE_MODE", "采集模式无效 / Invalid capture mode", "Use auto (default) or read_only. Auto may temporarily attach the Windows debugger at a recognized key-setup routine.")
+ 	}
++	selectedPID, err := capturePIDFromEnvironment()
++	if err != nil {
++		return m.status, fault.New("INVALID_CAPTURE_PID", "采集进程编号无效 / Invalid capture PID", "WXMORI_CAPTURE_PID must be a positive decimal uint32 identifying a normally enumerated Weixin.exe process.")
++	}
++	m.capturePID = selectedPID
+ 	m.mode = mode
+ 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+ 	m.cancel = cancel
+ 	m.done = make(chan struct{})
+ 	m.status = Status{Supported: true, Running: true, State: "waiting_for_wechat", Method: "windows_readonly_memory", StartedAt: time.Now().UTC().Format(time.RFC3339), Hint: "Open the WeChat client if necessary; wait for ready_for_login=true before asking the user to re-login locally. Keep WxMori running. / 请先打开微信客户端，等待 ready_for_login=true 后再请用户亲自重新登录，保持 WxMori 运行。"}
++	// Read only the opt-in flags here, before the first cached-DB completion
++	// check. The explicit ciphertext probe is validated before any attachment.
++	m.status.ImageProbeEnabled = imageProbeConfigured()
+ 	go m.run(ctx, m.done)
+ 	return m.status, nil
+ }
++
++func capturePIDFromEnvironment() (uint32, error) {
++	text := strings.TrimSpace(os.Getenv("WXMORI_CAPTURE_PID"))
++	if text == "" {
++		return 0, nil
++	}
++	for _, digit := range text {
++		if digit < '0' || digit > '9' {
++			return 0, errors.New("capture PID must be positive decimal")
++		}
++	}
++	value, err := strconv.ParseUint(text, 10, 32)
++	if err != nil || value == 0 {
++		return 0, errors.New("capture PID must be positive uint32")
++	}
++	return uint32(value), nil
++}
++
++// Only choose from normal enumeration results; an explicit PID is never opened
++// independently and never falls back to a different account's native process.
++func restrictCaptureProcesses(processes []*process, selected uint32) []*process {
++	if selected == 0 {
++		return processes
++	}
++	filtered := make([]*process, 0, 1)
++	for _, process := range processes {
++		if process.pid == selected {
++			filtered = append(filtered, process)
++		} else {
++			process.close()
++		}
++	}
++	return filtered
++}
+ func (m *Manager) Stop() Status {
+ 	m.mu.Lock()
+ 	cancel, done := m.cancel, m.done
+@@ -104,7 +151,9 @@ func (m *Manager) Stop() Status {
+ }
+ func (m *Manager) Close() { m.Stop() }
+ 
+-var requiredName = regexp.MustCompile(`^message_[0-9]+\.db$`)
++// Include local attachment stores for the explicitly requested media export.
++// 附件导出还需要语音、资源、表情及硬链接数据库。
++var requiredName = regexp.MustCompile(`^(message_[0-9]+|media_[0-9]+|message_resource|emoticon|hardlink)\.db$`)
+ var errLoginRestart = errors.New("WeChat process restarted")
+ 
+ func targets(root string) ([]Target, string, error) {
+@@ -210,6 +259,14 @@ func (m *Manager) run(ctx context.Context, done chan struct{}) {
+ 	defer close(done)
+ 	keys := map[[16]byte][32]byte{}
+ 	defer clear(keys)
++	// Reuse authenticated local material while collecting additional media keys.
++	// 补充媒体密钥时保留此前由本机用户保护的数据库密钥。
++	if existing, err := m.c.Keys(); err == nil {
++		for salt, key := range existing.BySalt {
++			keys[salt] = key
++		}
++		existing.Clear()
++	}
+ 	probes := map[uint32]*Probe{}
+ 	defer func() {
+ 		for _, p := range probes {
+@@ -279,7 +336,8 @@ func (m *Manager) run(ctx context.Context, done chan struct{}) {
+ 				hasMessage = true
+ 			}
+ 		}
+-		if len(ts) > 0 && verified == len(ts) && hasContact && hasMessage {
++		databasesComplete := len(ts) > 0 && verified == len(ts) && hasContact && hasMessage
++		if m.goalsComplete(databasesComplete) {
+ 			if time.Since(stableSince) >= 5*time.Second {
+ 				m.mu.Lock()
+ 				m.status.State = "completed"
+@@ -296,6 +354,7 @@ func (m *Manager) run(ctx context.Context, done chan struct{}) {
+ 				m.fail(fault.New("PROCESS_ENUMERATION_FAILED", "无法枚举微信进程 / Could not enumerate WeChat processes", "Retry from a normal local Windows session."))
+ 				return
+ 			}
++			processes = restrictCaptureProcesses(processes, m.capturePID)
+ 			m.mu.Lock()
+ 			m.status.ActiveProcesses = len(processes)
+ 			m.status.AccessDenied = denied
+@@ -381,7 +440,7 @@ func (m *Manager) run(ctx context.Context, done chan struct{}) {
+ 					}
+ 					return
+ 				}
+-				if validKeys(ts, keys) == len(ts) {
++				if m.goalsComplete(validKeys(ts, keys) == len(ts)) {
+ 					for _, rest := range processes[i+1:] {
+ 						rest.close()
+ 					}
+diff --git a/internal/keycapture/memory_windows.go b/internal/keycapture/memory_windows.go
+index 0c02d6b..7e1a269 100644
+--- a/internal/keycapture/memory_windows.go
++++ b/internal/keycapture/memory_windows.go
+@@ -5,10 +5,11 @@ package keycapture
+ import (
+ 	"context"
+ 	"errors"
+-	"golang.org/x/sys/windows"
+ 	"sort"
+ 	"strings"
+ 	"unsafe"
++
++	"golang.org/x/sys/windows"
+ )
+ 
+ type process struct {
+@@ -19,7 +20,42 @@ type process struct {
+ }
+ 
+ func platformSupported() bool { return unsafe.Sizeof(uintptr(0)) == 8 }
++
++// Native token SIDs are compared before inspecting any remote memory regions.
++// 原生令牌 SID 必须先匹配当前 Windows 用户，随后才能检查进程内存区域。
++// The upstream WxMori MIT copyright and license remain unchanged; see LICENSE.
++func sameOwnerSID(current, owner *windows.SID) bool {
++	return current != nil && owner != nil && current.Equals(owner)
++}
++
++func processHasUserSID(handle windows.Handle, current *windows.SID) (bool, error) {
++	if current == nil {
++		return false, errors.New("current-user SID unavailable")
++	}
++	var token windows.Token
++	if err := windows.OpenProcessToken(handle, windows.TOKEN_QUERY, &token); err != nil {
++		return false, err
++	}
++	defer token.Close()
++	owner, err := token.GetTokenUser()
++	if err != nil {
++		return false, err
++	}
++	return sameOwnerSID(current, owner.User.Sid), nil
++}
++
+ func listProcesses() ([]*process, int, error) {
++	selectedPID, err := capturePIDFromEnvironment()
++	if err != nil {
++		return nil, 0, err
++	}
++	current, err := windows.GetCurrentProcessToken().GetTokenUser()
++	if err != nil {
++		return nil, 0, errors.New("current-user token unavailable")
++	}
++	if current.User.Sid == nil {
++		return nil, 0, errors.New("current-user SID unavailable")
++	}
+ 	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+ 	if err != nil {
+ 		return nil, 0, err
+@@ -31,16 +67,26 @@ func listProcesses() ([]*process, int, error) {
+ 	var out []*process
+ 	denied := 0
+ 	for err == nil {
+-		if strings.EqualFold(windows.UTF16ToString(entry.ExeFile[:]), "Weixin.exe") {
++		if strings.EqualFold(windows.UTF16ToString(entry.ExeFile[:]), "Weixin.exe") && (selectedPID == 0 || entry.ProcessID == selectedPID) {
+ 			h, e := windows.OpenProcess(windows.PROCESS_QUERY_INFORMATION|windows.PROCESS_VM_READ, false, entry.ProcessID)
+ 			if e != nil {
+ 				if errors.Is(e, windows.ERROR_ACCESS_DENIED) {
+ 					denied++
+ 				}
+ 			} else {
+-				p := &process{pid: entry.ProcessID, handle: h}
+-				p.loadRegions()
+-				out = append(out, p)
++				owned, ownerErr := processHasUserSID(h, current.User.Sid)
++				if ownerErr != nil || !owned {
++					// No retry against another identity, even for an explicit PID.
++					// 显式 PID 也不能绕过用户隔离；未知或其它用户一律跳过。
++					windows.CloseHandle(h)
++					if ownerErr != nil {
++						denied++
++					}
++				} else {
++					p := &process{pid: entry.ProcessID, handle: h}
++					p.loadRegions()
++					out = append(out, p)
++				}
+ 			}
+ 		}
+ 		err = windows.Process32Next(snapshot, &entry)
+diff --git a/internal/keycapture/mismatch.go b/internal/keycapture/mismatch.go
+index ff22854..9df6d5d 100644
+--- a/internal/keycapture/mismatch.go
++++ b/internal/keycapture/mismatch.go
+@@ -2,6 +2,7 @@ package keycapture
+ 
+ import (
+ 	"crypto/sha256"
++	"os"
+ 	"path/filepath"
+ 	"time"
+ 
+@@ -24,6 +25,10 @@ type mismatchProbe struct {
+ 	since        time.Time
+ }
+ 
++// Keep upstream account discovery injectable for synthetic scope tests.
++// 仅为合成范围测试保留上游账号枚举入口；不改变上游 MIT 许可归属。
++var mismatchAccounts = config.Accounts
++
+ func (p *mismatchProbe) Clear() {
+ 	for _, a := range p.alternatives {
+ 		a.probe.Clear()
+@@ -34,6 +39,14 @@ func (p *mismatchProbe) Clear() {
+ // Inspect only first pages of at most eight local alternatives; never decrypt
+ // or persist their keys. AES candidates alone are not evidence of a mismatch.
+ func (p *mismatchProbe) reload(c config.Config) {
++	// The selected-account wrapper opts out before enumerating or reading any
++	// alternative account. Clear diagnostics retained before the flag changed.
++	// 单账号工具在枚举或读取其它账号之前退出，并清除此前保留的诊断资料。
++	if os.Getenv("WXMORI_STRICT_ACCOUNT_ONLY") == "1" {
++		p.Clear()
++		p.since = time.Time{}
++		return
++	}
+ 	previous := p.alternatives
+ 	p.alternatives = nil
+ 	defer func() {
+@@ -41,7 +54,7 @@ func (p *mismatchProbe) reload(c config.Config) {
+ 			a.probe.Clear()
+ 		}
+ 	}()
+-	for _, account := range config.Accounts(c.DataDir, "", c.Path) {
++	for _, account := range mismatchAccounts(c.DataDir, "", c.Path) {
+ 		if keyring.AccountID(account.DataDir) == keyring.AccountID(c.DataDir) {
+ 			continue
+ 		}
+diff --git a/internal/keycapture/process_owner_windows_test.go b/internal/keycapture/process_owner_windows_test.go
+new file mode 100644
+index 0000000..52213fd
+--- /dev/null
++++ b/internal/keycapture/process_owner_windows_test.go
+@@ -0,0 +1,55 @@
++//go:build windows
++
++package keycapture
++
++// Synthetic SID comparisons and the test process's own token only.
++// 仅使用合成 SID 及测试进程自身令牌，不枚举微信、账号或进程内存。
++// Upstream WxMori retains its MIT copyright and license; see LICENSE.
++
++import (
++	"testing"
++
++	"golang.org/x/sys/windows"
++)
++
++func TestSameOwnerSIDRequiresNonNilEqualNativeSID(t *testing.T) {
++	first, err := windows.StringToSid("S-1-5-21-11-22-33-1001")
++	if err != nil {
++		t.Fatal("synthetic SID construction failed")
++	}
++	copy, err := windows.StringToSid("S-1-5-21-11-22-33-1001")
++	if err != nil {
++		t.Fatal("synthetic SID construction failed")
++	}
++	other, err := windows.StringToSid("S-1-5-21-11-22-33-1002")
++	if err != nil {
++		t.Fatal("synthetic SID construction failed")
++	}
++	if !sameOwnerSID(first, copy) || sameOwnerSID(first, other) || sameOwnerSID(nil, first) || sameOwnerSID(first, nil) || sameOwnerSID(nil, nil) {
++		t.Fatal("native owner comparison did not fail closed")
++	}
++}
++
++func TestOwnTestProcessTokenMatchesAndUnknownHandleFailsClosed(t *testing.T) {
++	current, err := windows.GetCurrentProcessToken().GetTokenUser()
++	if err != nil || current.User.Sid == nil {
++		t.Fatal("test-process token unavailable")
++	}
++	owned, err := processHasUserSID(windows.CurrentProcess(), current.User.Sid)
++	if err != nil || !owned {
++		t.Fatal("test process did not match its own token")
++	}
++	if owned, err := processHasUserSID(0, current.User.Sid); err == nil || owned {
++		t.Fatal("unknown process token was accepted")
++	}
++	if owned, err := processHasUserSID(windows.CurrentProcess(), nil); err == nil || owned {
++		t.Fatal("unknown expected owner was accepted")
++	}
++	nullOwner, err := windows.StringToSid("S-1-0-0")
++	if err != nil {
++		t.Fatal("synthetic SID construction failed")
++	}
++	if owned, err := processHasUserSID(windows.CurrentProcess(), nullOwner); err != nil || owned {
++		t.Fatal("unrelated synthetic owner was accepted")
++	}
++}
+diff --git a/internal/keycapture/strict_account_test.go b/internal/keycapture/strict_account_test.go
+new file mode 100644
+index 0000000..426bc85
+--- /dev/null
++++ b/internal/keycapture/strict_account_test.go
+@@ -0,0 +1,57 @@
++package keycapture
++
++// Synthetic tests for the selected-account adaptation of upstream WxMori.
++// 上游 WxMori 的 MIT 许可与版权声明保持不变，见仓库 LICENSE。
++
++import (
++	"testing"
++	"time"
++
++	"github.com/axiomzero-qed/WxMori/internal/config"
++)
++
++func TestStrictAccountSkipsAlternativeDiscoveryAndClearsPriorState(t *testing.T) {
++	t.Setenv("WXMORI_STRICT_ACCOUNT_ONLY", "1")
++	previous := mismatchAccounts
++	defer func() { mismatchAccounts = previous }()
++	enumerations := 0
++	mismatchAccounts = func(_, _, _ string) []config.Account {
++		enumerations++
++		return nil
++	}
++	remembered := NewProbe(nil)
++	var salt [16]byte
++	var key [32]byte
++	salt[0], key[0] = 17, 29
++	remembered.Keys[salt] = key
++	probe := mismatchProbe{
++		alternatives: []alternative{{probe: remembered}},
++		since:        time.Now(),
++	}
++	// Deliberately non-existent synthetic strings; the enumerator is replaced
++	// and strict mode must return without consulting any filesystem or process.
++	// 完全合成的路径与替代枚举器；严格模式不得触及真实文件或进程。
++	probe.reload(config.Config{DataDir: "synthetic-only/db_storage", Path: "synthetic-only/config.json"})
++	if enumerations != 0 {
++		t.Fatal("strict mode enumerated alternative accounts")
++	}
++	if len(probe.alternatives) != 0 || len(remembered.Keys) != 0 || !probe.since.IsZero() {
++		t.Fatal("strict mode retained alternative-account diagnostics")
++	}
++}
++
++func TestNonStrictDiscoveryUsesOnlySyntheticEnumerator(t *testing.T) {
++	t.Setenv("WXMORI_STRICT_ACCOUNT_ONLY", "0")
++	previous := mismatchAccounts
++	defer func() { mismatchAccounts = previous }()
++	enumerations := 0
++	mismatchAccounts = func(_, _, _ string) []config.Account {
++		enumerations++
++		return nil
++	}
++	probe := mismatchProbe{}
++	probe.reload(config.Config{DataDir: "synthetic-only/db_storage", Path: "synthetic-only/config.json"})
++	if enumerations != 1 {
++		t.Fatal("non-strict mode did not use the synthetic upstream discovery hook")
++	}
++}
+diff --git a/internal/keyring/image_other.go b/internal/keyring/image_other.go
+new file mode 100644
+index 0000000..9cebbbb
+--- /dev/null
++++ b/internal/keyring/image_other.go
+@@ -0,0 +1,5 @@
++//go:build !windows
++
++package keyring
++
++func SaveImageCandidate(string, [16]byte) error { return unsupported() }
+diff --git a/internal/keyring/image_windows.go b/internal/keyring/image_windows.go
+new file mode 100644
+index 0000000..5ad033c
+--- /dev/null
++++ b/internal/keyring/image_windows.go
+@@ -0,0 +1,101 @@
++//go:build windows
++
++package keyring
++
++import (
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"os"
++	"path/filepath"
++
++	"golang.org/x/sys/windows"
++)
++
++func privateImageACL(path string, directory bool) error {
++	user, err := windows.GetCurrentProcessToken().GetTokenUser()
++	if err != nil {
++		return err
++	}
++	inherit := ""
++	if directory {
++		inherit = "OICI"
++	}
++	sid := user.User.Sid.String()
++	aces := "(A;" + inherit + ";FA;;;" + sid + ")"
++	if sid != "S-1-5-18" {
++		aces += "(A;" + inherit + ";FA;;;SY)"
++	}
++	sd, err := windows.SecurityDescriptorFromString("O:" + sid + "D:P" + aces)
++	if err != nil {
++		return err
++	}
++	dacl, _, err := sd.DACL()
++	if err != nil {
++		return err
++	}
++	return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT,
++		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
++		nil, nil, dacl, nil)
++}
++
++// SaveImageCandidate never shares the database-key schema: the plaintext is
++// {aes: 16-byte hex, xor: null}, protected by DPAPI without optional entropy.
++func SaveImageCandidate(path string, key [16]byte) error {
++	defer clear(key[:])
++	if path == "" {
++		return errors.New("image candidate output is required")
++	}
++	parent := filepath.Dir(path)
++	if err := os.MkdirAll(parent, 0700); err != nil {
++		return errors.New("image candidate directory unavailable")
++	}
++	if info, err := os.Lstat(parent); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
++		return errors.New("image candidate parent must be a directory")
++	}
++	if err := privateImageACL(parent, true); err != nil {
++		return errors.New("image candidate directory ACL failed")
++	}
++	plain, err := json.Marshal(struct {
++		AES string `json:"aes"`
++		XOR *int   `json:"xor"`
++	}{hex.EncodeToString(key[:]), nil})
++	if err != nil {
++		return errors.New("image candidate encoding failed")
++	}
++	defer clear(plain)
++	sealed, err := protect(plain)
++	if err != nil {
++		return errors.New("image candidate DPAPI failed")
++	}
++	data, err := json.Marshal(Envelope{Format: "local-image.dpapi.v1", Protected: sealed})
++	if err != nil {
++		return errors.New("image candidate envelope failed")
++	}
++	tmp, err := os.CreateTemp(parent, ".image-candidate-")
++	if err != nil {
++		return errors.New("image candidate staging failed")
++	}
++	name := tmp.Name()
++	defer os.Remove(name)
++	if err = privateImageACL(name, false); err == nil {
++		_, err = tmp.Write(append(data, '\n'))
++	}
++	if err == nil {
++		err = tmp.Sync()
++	}
++	closeErr := tmp.Close()
++	if err == nil {
++		err = closeErr
++	}
++	if err == nil {
++		err = os.Rename(name, path)
++	}
++	if err != nil {
++		return errors.New("image candidate publishing failed")
++	}
++	if err := privateImageACL(path, false); err != nil {
++		return errors.New("image candidate ACL failed")
++	}
++	return nil
++}
+diff --git a/internal/keyring/image_windows_test.go b/internal/keyring/image_windows_test.go
+new file mode 100644
+index 0000000..bf9b3ec
+--- /dev/null
++++ b/internal/keyring/image_windows_test.go
+@@ -0,0 +1,48 @@
++//go:build windows
++
++package keyring
++
++import (
++	"bytes"
++	"encoding/hex"
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestImageCandidateDPAPIRoundTrip(t *testing.T) {
++	var key [16]byte
++	for i := range key {
++		key[i] = byte(i + 61)
++	}
++	path := filepath.Join(t.TempDir(), "candidate.json")
++	for i := 0; i < 2; i++ {
++		if err := SaveImageCandidate(path, key); err != nil {
++			t.Fatal(err)
++		}
++	}
++	data, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if bytes.Contains(data, []byte(hex.EncodeToString(key[:]))) {
++		t.Fatal("plaintext image key was saved")
++	}
++	var envelope Envelope
++	if err := json.Unmarshal(data, &envelope); err != nil || envelope.Format != "local-image.dpapi.v1" {
++		t.Fatal("incompatible image envelope")
++	}
++	plain, err := unprotect(envelope.Protected)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer clear(plain)
++	var decoded struct {
++		AES string `json:"aes"`
++		XOR *int   `json:"xor"`
++	}
++	if err := json.Unmarshal(plain, &decoded); err != nil || decoded.AES != hex.EncodeToString(key[:]) || decoded.XOR != nil {
++		t.Fatal("incompatible protected image payload")
++	}
++}
+diff --git a/internal/windebug/watch_windows_amd64.go b/internal/windebug/watch_windows_amd64.go
+index e2d5f4c..4a41e1c 100644
+--- a/internal/windebug/watch_windows_amd64.go
++++ b/internal/windebug/watch_windows_amd64.go
+@@ -83,6 +83,13 @@ func putThread(handle windows.Handle, c *threadContext, backing []byte) error {
+ // initial breakpoint has been handled. candidate runs after resuming the target.
+ // tick may return an error to stop; cleanup restores owned registers and detaches.
+ func Watch(ctx context.Context, pid uint32, addresses []uintptr, ready func(), candidate func([32]byte), tick func() error) (retErr error) {
++	return WatchWithImage(ctx, pid, addresses, ready, candidate, nil, tick)
++}
++
++// WatchWithImage optionally observes AES-128 inputs at the same recognized
++// routine. The database callback remains AES-256-only. Both callbacks run
++// after resuming the target and must neither retain nor log unverified keys.
++func WatchWithImage(ctx context.Context, pid uint32, addresses []uintptr, ready func(), candidate func([32]byte), imageCandidate func([16]byte), tick func() error) (retErr error) {
+ 	if err := ctx.Err(); err != nil {
+ 		return err
+ 	}
+@@ -225,6 +232,8 @@ func Watch(ctx context.Context, pid uint32, addresses []uintptr, ready func(), c
+ 		}
+ 		pending, pendingStatus = &event, 0x10002
+ 		var key [32]byte
++		var imageKey [16]byte
++		hasImageKey := false
+ 		hasKey, armed := false, false
+ 		switch event.Code {
+ 		case 2, 3:
+@@ -278,16 +287,23 @@ func Watch(ctx context.Context, pid uint32, addresses []uintptr, ready func(), c
+ 					}
+ 				}
+ 				if ours {
+-					if c.Rdx == 256 && c.Rcx >= 0x10000 {
++					if uint32(c.Rdx) == 256 && c.Rcx >= 0x10000 {
+ 						var n uintptr
+ 						if err := windows.ReadProcessMemory(process, uintptr(c.Rcx), &key[0], 32, &n); err == nil && n == 32 {
+ 							hasKey = true
+ 						}
+ 					}
++					if imageCandidate != nil && uint32(c.Rdx) == 128 && c.Rcx >= 0x10000 {
++						var n uintptr
++						if err := windows.ReadProcessMemory(process, uintptr(c.Rcx), &imageKey[0], 16, &n); err == nil && n == 16 {
++							hasImageKey = true
++						}
++					}
+ 					c.Dr6 &^= 15
+ 					c.EFlags |= 1 << 16 // resume past this execution breakpoint once
+ 					if err := putThread(saved.handle, c, backing); err != nil {
+ 						clear(key[:])
++						clear(imageKey[:])
+ 						return err
+ 					}
+ 					pendingStatus = 0x10002
+@@ -296,6 +312,7 @@ func Watch(ctx context.Context, pid uint32, addresses []uintptr, ready func(), c
+ 		}
+ 		if err := ack(&event, pendingStatus); err != nil {
+ 			clear(key[:])
++			clear(imageKey[:])
+ 			return err
+ 		}
+ 		pending = nil
+@@ -306,5 +323,9 @@ func Watch(ctx context.Context, pid uint32, addresses []uintptr, ready func(), c
+ 			candidate(key)
+ 			clear(key[:])
+ 		}
++		if hasImageKey {
++			imageCandidate(imageKey)
++			clear(imageKey[:])
++		}
+ 	}
+ }
+diff --git a/internal/windebug/watch_windows_amd64_test.go b/internal/windebug/watch_windows_amd64_test.go
+index 1f507b1..dfca661 100644
+--- a/internal/windebug/watch_windows_amd64_test.go
++++ b/internal/windebug/watch_windows_amd64_test.go
+@@ -35,6 +35,10 @@ func TestDebugSyntheticHelper(t *testing.T) {
+ 	input := bufio.NewScanner(os.Stdin)
+ 	for input.Scan() {
+ 		switch input.Text() {
++		case "fire128":
++			syscall.SyscallN(cb, uintptr(unsafe.Pointer(&key[0])), 128, 0)
++			runtime.KeepAlive(&key)
++			fmt.Println("fired128")
+ 		case "fire":
+ 			syscall.SyscallN(cb, uintptr(unsafe.Pointer(&key[0])), 256, 0)
+ 			runtime.KeepAlive(&key)
+@@ -45,6 +49,72 @@ func TestDebugSyntheticHelper(t *testing.T) {
+ 	}
+ }
+ 
++func TestWatchOptionalImageCandidateAndDatabaseCallback(t *testing.T) {
++	exe, err := os.Executable()
++	if err != nil {
++		t.Fatal(err)
++	}
++	cmd := exec.Command(exe, "-test.run=^TestDebugSyntheticHelper$")
++	cmd.Env = append(os.Environ(), "WXMORI_DEBUG_SYNTHETIC_HELPER=1")
++	stdout, err := cmd.StdoutPipe()
++	if err != nil {
++		t.Fatal(err)
++	}
++	in, err := cmd.StdinPipe()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := cmd.Start(); err != nil {
++		t.Fatal(err)
++	}
++	defer func() { fmt.Fprintln(in, "quit"); in.Close(); cmd.Wait() }()
++	reader := bufio.NewReader(stdout)
++	line, err := reader.ReadString('\n')
++	if err != nil {
++		t.Fatal(err)
++	}
++	address, err := strconv.ParseUint(strings.TrimSpace(line), 16, 64)
++	if err != nil {
++		t.Fatal(err)
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++	images, databases := 0, 0
++	err = WatchWithImage(ctx, uint32(cmd.Process.Pid), []uintptr{uintptr(address)}, func() {
++		fmt.Fprintln(in, "fire128")
++	}, func(key [32]byte) {
++		databases++
++		for i, value := range key {
++			if value != byte(71+i) {
++				t.Error("database candidate changed")
++			}
++		}
++		cancel()
++	}, func(key [16]byte) {
++		images++
++		for i, value := range key {
++			if value != byte(71+i) {
++				t.Error("image candidate changed")
++			}
++		}
++		fmt.Fprintln(in, "fire")
++	}, nil)
++	if !errors.Is(err, context.Canceled) || images != 1 || databases != 1 {
++		t.Fatalf("optional observer callback counts image=%d database=%d err=%v", images, databases, err)
++	}
++	for _, expected := range []string{"fired128", "fired"} {
++		line, err := reader.ReadString('\n')
++		if err != nil || strings.TrimSpace(line) != expected {
++			t.Fatal("synthetic child did not resume")
++		}
++	}
++	fmt.Fprintln(in, "fire128")
++	line, err = reader.ReadString('\n')
++	if err != nil || strings.TrimSpace(line) != "fired128" {
++		t.Fatal("synthetic child failed after image-observer detach")
++	}
++}
++
+ func TestWatchCapturesOnlySyntheticChildAndDetaches(t *testing.T) {
+ 	// Reuse one debugger OS thread and keep unrelated scheduler workers out of
+ 	// this process-wide handle measurement. Watch still pins itself in normal use.

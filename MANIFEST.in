@@ -1,0 +1,7 @@
+include LICENSE THIRD_PARTY_NOTICES.md README.md package.json package-lock.json
+recursive-include licenses *
+recursive-include patches *.patch
+recursive-include scripts *.py *.ps1
+recursive-include docs *.md
+recursive-include tests *.py
+recursive-include src/wechat_export_tool/assets *.cjs
